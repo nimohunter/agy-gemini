@@ -1,12 +1,6 @@
 # agy-gemini
 
-Claude Code uses Gemini 3.8 Flash as a plain text model through the agy CLI.
-The agy CLI is the Google Antigravity CLI.
-Gemini works like an API.
-Gemini reads long input and writes long output.
-Claude is the agent and supervisor.
-Claude picks files, reviews every result, applies changes, and runs commands.
-This saves Claude tokens.
+Claude Code combines two models. Claude (for example Opus) makes the decisions: the plan, short specs, the review, and the final check. Gemini 3.8 Flash, through the agy CLI, does the long work: reading large text and project files, and writing code, tests, and documents. Gemini has no tools; Claude applies changes and runs all commands. This saves Claude tokens. The agy CLI is the Google Antigravity CLI.
 
 ## How it works
 
@@ -18,6 +12,9 @@ Claude runs agy_run.py ask
   │
   ▼
 agy runs agent "agy-gemini-plain" in an empty folder (guard hook active)
+  │
+  ▼
+With --read-tools: Gemini asks to READ, SEARCH, or LIST project files; the script answers automatically (several rounds)
   │
   ▼
 Gemini answers
@@ -34,6 +31,28 @@ Claude runs agy_run.py apply
   ▼
 Claude runs the project's tests itself
 ```
+
+## How Claude and Gemini share the work
+
+| Phase | Who | Notes |
+|---|---|---|
+| 1. Clarify the request | Claude, with the user | |
+| 2. Collect context (code, logs, issues, docs) | Gemini | Use `--read-tools`, or send files with `--file`. Ask for exact quotes. |
+| 3. Decide the approach and the plan | Claude | Keep it short. |
+| 4. Write a spec for each step | Claude | Use the spec template in SKILL.md. |
+| 5. Write the code | Gemini | One part per call. See "Size of one call" in SKILL.md. |
+| 6. Write the tests | Gemini, in a **separate** conversation | Tests follow the spec, not the code. |
+| 7. Run tests, lint, and build | Claude runs them | |
+| 8. Fix failures | Gemini, given the exact error | After 2 failed rounds, Claude takes over. |
+| 9. Review | Claude | Depth depends on the risk level. |
+| 10. Docs, commit messages, translation | Gemini | Claude checks the facts. |
+| 11. Report to the user | Claude | |
+
+- **Low** (tests, docs, scripts, simple glue code): Gemini writes. Claude checks with tests and a quick skim for dangerous operations.
+- **Medium** (normal business logic): Gemini writes. Claude reads the full diff.
+- **High** (money and ledgers, authentication, permissions, secrets, file access, migrations, concurrency): Claude writes the spec in detail and reads every line of the diff. If the change is small or subtle, Claude writes it.
+
+The full rules for Claude are in agy-gemini/SKILL.md.
 
 ## Requirements
 
@@ -108,6 +127,12 @@ Follow-up:
 gemini continue: handle the case where the user token is expired
 ```
 
+Find code:
+```
+use gemini to find where the retry logic is implemented and quote the lines
+```
+Claude then uses `--read-tools`, so Gemini finds the files itself.
+
 ## When to use it
 
 Good jobs:
@@ -132,6 +157,14 @@ Safety layers for every Gemini call:
 4. Secret files and secret-looking content are blocked before anything is sent.
 5. Edits are only proposals. Paths are checked. Nothing is written until `apply`.
 
+With --read-tools:
+- Only files inside the project folder.
+- Protected files (.env, keys, .git and similar) are refused.
+- A file with secret-looking content is not shown at all.
+- SEARCH hides lines with secret-looking content.
+- Folders such as node_modules, target, build, and .venv are skipped.
+- When the project folder is the top level of a git repository, git-ignored files are not listed or searched.
+
 What it does not protect:
 - Everything you send goes to Google.
 - The secret scan uses patterns. It can miss secrets or report false alarms.
@@ -150,6 +183,8 @@ So your own agy sessions are not affected.
 - The Claude Code allowed-tools permission lasts only for the turn that starts the skill.
 - Later follow-ups may ask for permission.
 - Prompts, answers, and old file versions for undo are kept in `~/.cache/agy-gemini/runs/` (the newest 30 tasks).
+- Gemini's reply has an output limit of about 65,000 tokens, and its thinking counts toward it, so large tasks must be split into parts (this happened during development).
+- With --read-tools: one READ shows at most 60 KB, SEARCH returns at most 50 matching lines, LIST returns at most 200 paths, and the default is at most 8 request rounds (--max-reads). Paths with spaces are not supported in read requests.
 
 ## Configuration
 
@@ -178,6 +213,8 @@ Options for `ask`:
 - `--continue`: follow-up in the same Gemini conversation.
 - `--timeout`: seconds for Gemini (default 480).
 - `--allow-secrets`: skip the secret scan (only with the user's consent).
+- `--read-tools`: Gemini may ask to read, search, or list project files.
+- `--max-reads N`: maximum number of request rounds (default 8).
 
 ## Uninstall
 

@@ -218,55 +218,55 @@ class TestIsSensitive(unittest.TestCase):
 
 class TestFindSecrets(unittest.TestCase):
     def test_detects_aws_key(self):
-        secret = "AKIA" + "J" * 16
-        findings = r.find_secrets(secret)
+        fake = "AKIA" + "J" * 16
+        findings = r.find_secrets(fake)
         labels = [kind for _, kind, _ in findings]
         self.assertIn("AWS access key", labels)
         for _, _, masked in findings:
-            self.assertNotIn(secret, masked)
+            self.assertNotIn(fake, masked)
 
     def test_detects_github_token(self):
-        secret = "gh" + "p_" + "a" * 36
-        findings = r.find_secrets(secret)
+        fake = "gh" + "p_" + "a" * 36
+        findings = r.find_secrets(fake)
         labels = [kind for _, kind, _ in findings]
         self.assertIn("GitHub token", labels)
         for _, _, masked in findings:
-            self.assertNotIn(secret, masked)
+            self.assertNotIn(fake, masked)
 
     def test_detects_private_key_header(self):
-        secret = "-----BEGIN " + "RSA PRIVATE KEY-----"
-        findings = r.find_secrets(secret)
+        fake = "-----BEGIN " + "RSA PRIVATE KEY-----"
+        findings = r.find_secrets(fake)
         labels = [kind for _, kind, _ in findings]
         self.assertIn("private key", labels)
         for _, _, masked in findings:
-            self.assertNotIn(secret, masked)
+            self.assertNotIn(fake, masked)
 
     def test_detects_password_in_url(self):
-        secret = "secretpass" + "123"
-        url = "https://user:" + secret + "@example.com"
+        fake = "secretpass" + "123"
+        url = "https://user:" + fake + "@example.com"
         findings = r.find_secrets(url)
         labels = [kind for _, kind, _ in findings]
         self.assertIn("password in a URL", labels)
         for _, _, masked in findings:
-            self.assertNotIn(secret, masked)
+            self.assertNotIn(fake, masked)
 
     def test_detects_hardcoded_secret(self):
-        secret = "secrettoken" + "123456789"
-        line = 'api_key = "' + secret + '"'
+        fake = "secrettoken" + "123456789"
+        line = 'api_key = "' + fake + '"'
         findings = r.find_secrets(line)
         labels = [kind for _, kind, _ in findings]
         self.assertIn("hardcoded secret", labels)
         for _, _, masked in findings:
-            self.assertNotIn(secret, masked)
+            self.assertNotIn(fake, masked)
 
     def test_detects_env_secret(self):
-        secret = "envpassword" + "9"
-        line = "DB_PASSWORD=" + secret
+        fake = "envpassword" + "9"
+        line = "DB_PASSWORD=" + fake
         findings = r.find_secrets(line)
         labels = [kind for _, kind, _ in findings]
         self.assertIn("secret in an environment assignment", labels)
         for _, _, masked in findings:
-            self.assertNotIn(secret, masked)
+            self.assertNotIn(fake, masked)
 
     def test_ignores_placeholders(self):
         placeholders = [

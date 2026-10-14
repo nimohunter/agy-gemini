@@ -9,7 +9,7 @@ disk changes until `apply`.
 Commands:
   setup                 Install the agy agent and the guard hook. Run once, and after updates.
   doctor [--offline]    Check the setup and test agy's behavior. Run after every agy update.
-  ask [options] [TASK]  Send a task to Gemini. TASK is read from stdin when it is not given.
+  ask [options] [--read-tools] [--max-reads N] [TASK]  Send a task to Gemini. TASK is read from stdin when it is not given.
   apply TASK_ID         Write the latest proposed changes of a task to disk.
   revert TASK_ID        Undo all applied changes of a task.
   uninstall [--purge]   Remove the agent and the hook. --purge also deletes the saved tasks.
@@ -58,6 +58,14 @@ MAX_PROMPT_BYTES = 150_000  # agy cuts longer messages (tested: 159 KB arrives c
 ANSWER_LINES = 150
 INLINE_DIFF_LINES = 300
 TESTED_AGY_VERSIONS = "1.3.4, 1.3.5"
+READ_MAX_BYTES = 60_000
+SEARCH_MAX_MATCHES = 50
+LIST_MAX = 200
+SEARCH_FILE_MAX_BYTES = 1_000_000
+SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+    "target", ".next", ".idea", ".gradle",
+}
 
 AGENT_TEXT = f"""---
 name: {AGENT_NAME}
@@ -105,6 +113,18 @@ Rules:
 - Do not put edit blocks inside code fences.
 - After all edit blocks, write a short section that starts with "NOTES:". List what you changed,
   the commands the supervisor should run to test the change, and any open questions."""
+
+READ_TOOLS_RULES = """## Reading project files
+Before you answer, you can ask the supervisor program to show you project files.
+To ask, reply with ONLY request lines, one per line, and nothing else:
+READ <path>                 show a whole file
+READ <path> <start>-<end>   show lines start to end (1-based, inclusive)
+SEARCH <regex>              search all project files with a Python regular expression
+LIST <dir>                  list the files under a folder ("." is the project root)
+Paths are relative to the project folder. You may send up to 5 request lines in one reply.
+You get the results in the next message. You have at most {max_reads} request rounds.
+When you have enough information, give your final answer in the output format above.
+Never mix request lines and the final answer in one reply."""
 
 SENSITIVE_DIRS = {".git", ".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure"}
 SENSITIVE_FILES = [
@@ -397,6 +417,246 @@ def review_warnings(files, diff_text):
     return warnings
 
 
+# ---------- read tools ----------
+
+def parse_requests(text):
+    if not text:
+        return None
+    requests = []
+    has_non_ignored = False
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("```"):
+            continue
+        has_non_ignored = True
+        if s.startswith(("- ", "* ")):
+            s = s[2:].strip()
+        while s.startswith("`") and s.endswith("`") and len(s) >= 2:
+            s = s[1:-1].strip()
+        if s.startswith(("- ", "* ")):
+            s = s[2:].strip()
+
+        m_range = re.match(r"^READ\s+(\S.+?)\s+(\d+-\d+)$", s)
+        m_read = re.match(r"^READ\s+(\S.*)$", s)
+        m_search = re.match(r"^SEARCH\s+(\S.*)$", s)
+        m_list = re.match(r"^LIST\s+(\S.*)$", s)
+
+        if m_range:
+            requests.append(("READ", f"{m_range.group(1).strip()} {m_range.group(2)}"))
+        elif m_read:
+            requests.append(("READ", m_read.group(1).strip()))
+        elif m_search:
+            requests.append(("SEARCH", m_search.group(1).strip()))
+        elif m_list:
+            requests.append(("LIST", m_list.group(1).strip()))
+        else:
+            return None
+
+    if not requests or not has_non_ignored:
+        return None
+    return requests[:5]
+
+
+def project_files(root):
+    root = Path(root)
+    raw_paths = None
+    if (root / ".git").exists():
+        try:
+            r = subprocess.run(
+                ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+                cwd=root, capture_output=True, text=True, errors="replace"
+            )
+            if r.returncode == 0:
+                raw_paths = [p for p in r.stdout.split("\0") if p]
+        except Exception:
+            pass
+    if raw_paths is None:
+        raw_paths = []
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            dpath = Path(dirpath)
+            for f in filenames:
+                raw_paths.append((dpath / f).relative_to(root).as_posix())
+
+    result = []
+    for rel in raw_paths:
+        p = Path(rel)
+        if is_sensitive(p) or any(part in SKIP_DIRS for part in p.parts):
+            continue
+        result.append(rel)
+    return sorted(set(result))
+
+
+def run_request(root, kind, arg, allow_secrets):
+    root = Path(root).resolve()
+    header = f"=== {kind} {arg}\n"
+
+    def make_entry(status, text, note=""):
+        return {"kind": kind, "target": arg, "status": status, "bytes": len(text.encode("utf-8")), "note": note}
+
+    if kind == "READ":
+        m = re.match(r"^(\S.+?)\s+(\d+)-(\d+)$", arg)
+        if m:
+            path_str, start_line, end_line, has_range = m.group(1), int(m.group(2)), int(m.group(3)), True
+        else:
+            path_str, start_line, end_line, has_range = arg, 0, 0, False
+
+        p = Path(path_str)
+        if p.is_absolute() or path_str.startswith("/") or path_str.startswith("\\"):
+            text = header + "refused: absolute path\n"
+            return text, make_entry("refused", text, "absolute path")
+
+        target_path = (root / p).resolve()
+        if not under(target_path, root):
+            text = header + "refused: outside project folder\n"
+            return text, make_entry("refused", text, "outside project folder")
+
+        rel = target_path.relative_to(root)
+        if is_sensitive(rel):
+            text = header + "refused: protected file\n"
+            return text, make_entry("refused", text, "protected file")
+        if any(part in SKIP_DIRS for part in rel.parts):
+            text = header + "refused: ignored directory\n"
+            return text, make_entry("refused", text, "ignored directory")
+
+        if not target_path.is_file():
+            msg = "file not found" if not target_path.exists() else "not a file"
+            text = header + f"error: {msg}\n"
+            return text, make_entry("error", text, msg)
+
+        try:
+            content = read_text(target_path)
+        except ValueError as exc:
+            msg = str(exc)
+            text = header + f"error: {msg}\n"
+            return text, make_entry("error", text, msg)
+
+        if not allow_secrets:
+            found = find_secrets(content)
+            if found:
+                lines_str = ", ".join(str(line) for line in sorted({f[0] for f in found}))
+                msg = f"refused: possible secrets at lines {lines_str}; the file was not shown"
+                text = header + msg + "\n"
+                return text, make_entry("refused", text, "possible secrets")
+
+        flines = content.splitlines()
+        n_lines = len(flines)
+        if has_range:
+            start = max(1, start_line)
+            end = min(n_lines, end_line)
+            selected = [(i, flines[i - 1]) for i in range(start, end + 1)] if start <= end else []
+        else:
+            selected = [(i, flines[i - 1]) for i in range(1, n_lines + 1)]
+
+        out_lines = []
+        total_bytes = 0
+        cut = False
+        for i, line in selected:
+            formatted = f"{i:4d}| {line}"
+            line_bytes = len(formatted.encode("utf-8")) + 1
+            if total_bytes + line_bytes > READ_MAX_BYTES:
+                cut = True
+                if not out_lines:
+                    out_lines.append(formatted.encode("utf-8")[:READ_MAX_BYTES].decode("utf-8", errors="ignore"))
+                break
+            out_lines.append(formatted)
+            total_bytes += line_bytes
+
+        if cut:
+            out_lines.append("[cut: file continues; ask for a line range]")
+
+        body = "\n".join(out_lines) + ("\n" if out_lines else "")
+        text = header + body
+        return text, make_entry("ok", text)
+
+    elif kind == "SEARCH":
+        try:
+            rx = re.compile(arg)
+        except re.error as exc:
+            msg = f"invalid regex: {exc}"
+            text = header + f"error: {msg}\n"
+            return text, make_entry("error", text, msg)
+
+        matches = []
+        total_matches = 0
+        for rel in project_files(root):
+            fpath = root / rel
+            try:
+                if fpath.stat().st_size > SEARCH_FILE_MAX_BYTES:
+                    continue
+                content = read_text(fpath)
+            except (ValueError, OSError):
+                continue
+
+            for line_num, line in enumerate(content.splitlines(), 1):
+                if rx.search(line):
+                    total_matches += 1
+                    if len(matches) < SEARCH_MAX_MATCHES:
+                        if not allow_secrets and find_secrets(line):
+                            matches.append(f"{rel}:{line_num}: [hidden: possible secret]")
+                        else:
+                            matches.append(f"{rel}:{line_num}: {line[:200]}")
+
+        if total_matches > SEARCH_MAX_MATCHES:
+            summary = f"Total matches: {total_matches} (cut to {SEARCH_MAX_MATCHES})"
+        else:
+            summary = f"Total matches: {total_matches} (not cut)"
+
+        out_lines = matches + [summary]
+        text = header + "\n".join(out_lines) + "\n"
+        return text, make_entry("ok", text)
+
+    elif kind == "LIST":
+        path_str = arg.strip()
+        if not path_str or path_str == ".":
+            target_path = root
+        else:
+            p = Path(path_str)
+            if p.is_absolute() or path_str.startswith("/") or path_str.startswith("\\"):
+                text = header + "refused: absolute path\n"
+                return text, make_entry("refused", text, "absolute path")
+            target_path = (root / p).resolve()
+
+        if not under(target_path, root):
+            text = header + "refused: outside project folder\n"
+            return text, make_entry("refused", text, "outside project folder")
+
+        rel = target_path.relative_to(root)
+        if is_sensitive(rel):
+            text = header + "refused: protected file\n"
+            return text, make_entry("refused", text, "protected file")
+        if any(part in SKIP_DIRS for part in rel.parts):
+            text = header + "refused: ignored directory\n"
+            return text, make_entry("refused", text, "ignored directory")
+
+        if not target_path.is_dir():
+            msg = f"'{arg}' is not a directory"
+            text = header + f"error: {msg}\n"
+            return text, make_entry("error", text, msg)
+
+        all_files = project_files(root)
+        if target_path == root:
+            matching = all_files
+        else:
+            matching = [f for f in all_files if under((root / f).resolve(), target_path)]
+
+        total = len(matching)
+        shown = matching[:LIST_MAX]
+        if total > LIST_MAX:
+            summary = f"Total: {total} files (cut to {LIST_MAX})"
+        else:
+            summary = f"Total: {total} files" if total != 1 else "Total: 1 file"
+
+        out_lines = shown + [summary]
+        text = header + "\n".join(out_lines) + "\n"
+        return text, make_entry("ok", text)
+
+    else:
+        msg = f"unknown request kind '{kind}'"
+        text = header + f"error: {msg}\n"
+        return text, make_entry("error", text, msg)
+
+
 # ---------- agy calls ----------
 
 def guard_env(log_path):
@@ -433,6 +693,91 @@ def call_gemini(task_dir, n, model, message, conversation_id, timeout):
     if result is None:
         result = {"status": "NO_RESULT", "response": "", "error": (stderr or stdout).strip()[-2000:]}
     return result, count_tool_calls(guard_log)
+
+
+def read_loop(task_dir, n, model, message, conversation_id, a, root, meta):
+    start_time = time.time()
+    read_log = []
+    total_tool_calls = 0
+    total_usage = {"input_tokens": 0, "output_tokens": 0}
+    has_usage = False
+    conv_id = conversation_id
+    sent_cutoff = False
+
+    def update_usage(res):
+        nonlocal has_usage
+        u = res.get("usage") or {}
+        if isinstance(u.get("input_tokens"), int):
+            total_usage["input_tokens"] += u["input_tokens"]
+            has_usage = True
+        if isinstance(u.get("output_tokens"), int):
+            total_usage["output_tokens"] += u["output_tokens"]
+            has_usage = True
+
+    def finish(res):
+        if has_usage:
+            res.setdefault("usage", {})
+            res["usage"]["input_tokens"] = total_usage["input_tokens"]
+            res["usage"]["output_tokens"] = total_usage["output_tokens"]
+        if conv_id:
+            res["conversation_id"] = conv_id
+        (task_dir / f"round-{n}-reads.log").write_text("".join(json.dumps(e) + "\n" for e in read_log))
+        return res, total_tool_calls, read_log
+
+    call_timeout = max(60, int(a.timeout - (time.time() - start_time)))
+    result, calls = call_gemini(task_dir, n, model, message, conv_id, call_timeout)
+    total_tool_calls += calls
+    update_usage(result)
+    if result.get("conversation_id"):
+        conv_id = result["conversation_id"]
+    if result.get("status") != "SUCCESS":
+        return finish(result)
+
+    request_round = 0
+    while True:
+        requests = parse_requests(result.get("response") or "")
+        if requests is None:
+            break
+
+        request_round += 1
+        remaining_time = a.timeout - (time.time() - start_time)
+        if request_round > a.max_reads or remaining_time < 120:
+            if sent_cutoff:
+                result["status"] = "READ_LIMIT"
+                break
+            sent_cutoff = True
+            next_message = "No more requests are allowed. Give your final answer now, in the output format above."
+        else:
+            request_texts = []
+            for kind, arg in requests:
+                text, entry = run_request(root, kind, arg, a.allow_secrets)
+                read_log.append(entry)
+                request_texts.append(text)
+                if kind == "READ" and entry["status"] == "ok":
+                    m = re.match(r"^(\S.+?)\s+(\d+)-(\d+)$", arg)
+                    path_str = m.group(1) if m else arg
+                    target_path = (root / path_str).resolve()
+                    if under(target_path, root) and target_path.is_file():
+                        try:
+                            rel = str(target_path.relative_to(root))
+                            meta["sent"][rel] = sha(read_text(target_path))
+                        except (ValueError, OSError):
+                            pass
+            next_message = "\n\n".join(request_texts)
+            msg_bytes = next_message.encode("utf-8")
+            if len(msg_bytes) > MAX_PROMPT_BYTES:
+                next_message = msg_bytes[:MAX_PROMPT_BYTES].decode("utf-8", errors="ignore") + "\n[cut: results too large; ask for less]"
+
+        call_timeout = max(60, int(a.timeout - (time.time() - start_time)))
+        result, calls = call_gemini(task_dir, n, model, next_message, conv_id, call_timeout)
+        total_tool_calls += calls
+        update_usage(result)
+        if result.get("conversation_id"):
+            conv_id = result["conversation_id"]
+        if result.get("status") != "SUCCESS":
+            break
+
+    return finish(result)
 
 
 # ---------- commands ----------
@@ -585,6 +930,8 @@ def cmd_ask(a):
             parts.append(f"### {label}\n{fence}\n{text.rstrip(chr(10))}\n{fence}")
     parts.append("## Task\n" + prompt)
     parts.append(EDIT_RULES if a.edit else ANSWER_RULES)
+    if a.read_tools:
+        parts.append(READ_TOOLS_RULES.format(max_reads=a.max_reads))
     message = "\n\n".join(parts)
     size = len(message.encode("utf-8"))
     if size > MAX_PROMPT_BYTES:
@@ -600,7 +947,11 @@ def cmd_ask(a):
     model = MODELS.get(a.model, a.model)
     (task_dir / f"round-{n}-prompt.md").write_text(message)
     started = time.time()
-    result, tool_calls = call_gemini(task_dir, n, model, message, meta["conversation_id"], a.timeout)
+    if a.read_tools:
+        result, tool_calls, read_log = read_loop(task_dir, n, model, message, meta["conversation_id"], a, root, meta)
+    else:
+        result, tool_calls = call_gemini(task_dir, n, model, message, meta["conversation_id"], a.timeout)
+        read_log = []
     seconds = int(time.time() - started)
     answer = result.get("response") or ""
     (task_dir / f"round-{n}-answer.md").write_text(answer)
@@ -615,6 +966,11 @@ def cmd_ask(a):
           f"Gemini tokens in {usage.get('input_tokens', '?')} out {usage.get('output_tokens', '?')}")
     print(f"Project: {root}")
     print(f"Files sent this round: {', '.join(to_send) or 'none'}")
+    if a.read_tools:
+        print(f"\n== Gemini read ({len(read_log)} requests)")
+        for entry in read_log:
+            note_str = f" - {entry['note']}" if entry.get("note") else ""
+            print(f"{entry['status']} {entry['kind']} {entry['target']} ({entry['bytes']} bytes){note_str}")
     if result.get("error"):
         print(f"\n== agy error\n{result['error']}")
     if tool_calls:
@@ -739,6 +1095,8 @@ def main():
     q.add_argument("--continue", dest="cont", metavar="TASK_ID", help="follow-up in the same Gemini conversation")
     q.add_argument("--timeout", type=int, default=480, help="seconds for Gemini (default 480)")
     q.add_argument("--allow-secrets", action="store_true", help="skip the secret scan (only with the user's consent)")
+    q.add_argument("--read-tools", action="store_true", help="enable the request loop")
+    q.add_argument("--max-reads", type=int, default=8, metavar="N", help="maximum number of request rounds (default 8)")
     q.add_argument("prompt", nargs="?")
     ap = sub.add_parser("apply")
     ap.add_argument("task")
