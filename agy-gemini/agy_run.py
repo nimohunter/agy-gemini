@@ -339,6 +339,7 @@ def replace_once(content, search_lines, replace_lines):
 
 
 def build_proposal(root, meta, blocks):
+    root = Path(root).resolve()  # paths below are resolved; compare against a resolved root (macOS /var -> /private/var)
     files, errors = {}, []
     for n, (raw, search, replace) in enumerate(blocks, 1):
         if Path(raw).is_absolute():
@@ -696,6 +697,7 @@ def call_gemini(task_dir, n, model, message, conversation_id, timeout):
 
 
 def read_loop(task_dir, n, model, message, conversation_id, a, root, meta):
+    root = Path(root).resolve()
     start_time = time.time()
     read_log = []
     total_tool_calls = 0
